@@ -1,4 +1,4 @@
-# Pin Tab Extension
+# Proper Pinned Tabs
 
 Safari-style global pinned tabs for Brave and Chrome (Manifest V3).
 
@@ -40,4 +40,4 @@ No popup, options page, or sync in v1.
 
 ## Debugging
 
-On `brave://extensions`, open **Service worker** for this extension. The console logs save / remove / restore actions prefixed with `[Pin Tab Extension]`. After pulling an update, click **Reload** on the extension card before retesting.
+On `brave://extensions`, open **Service worker** for this extension. The console logs save / remove / restore actions prefixed with `[Proper Pinned Tabs]`. After pulling an update, click **Reload** on the extension card before retesting.
