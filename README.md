@@ -6,7 +6,7 @@ Pinned tab URLs are saved in `chrome.storage.local` and restored as pinned tabs 
 
 ## Install from release
 
-1. Download **`pin-tab-extension-v1.0.1.zip`** from the [latest GitHub Release](https://github.com/IanRandall/PinnedTabExtension/releases/latest).
+1. Open the [latest GitHub Release](https://github.com/IanRandall/PinnedTabExtension/releases/latest) and download the latest `.zip` asset.
 2. Unzip the file (you should get a folder containing `manifest.json`).
 3. Open `brave://extensions` (or **Menu → Extensions → Manage extensions**).
 4. Turn on **Developer mode** (top right).
