@@ -1,12 +1,12 @@
 /**
- * Pin Tab Extension — Safari-style global pinned tabs for Chromium/Brave.
+ * Proper Pinned Tabs — Safari-style global pinned tabs for Chromium/Brave.
  * Keeps an ordered URL set in chrome.storage.local and restores pins into
  * every normal window until the user unpins or closes a pinned tab while
  * the browser is still open. Closing the last window does not clear the set.
  */
 
 const STORAGE_KEY = "pinnedUrls";
-const LOG_PREFIX = "[Pin Tab Extension]";
+const LOG_PREFIX = "[Proper Pinned Tabs]";
 
 /**
  * While > 0, ignore pin/unpin/storage writes from programmatic restore.
