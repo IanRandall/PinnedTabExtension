@@ -30,3 +30,7 @@ The same steps work in Chrome via `chrome://extensions`.
 | `icons/` | Extension icons |
 
 No popup, options page, or sync in v1.
+
+## Debugging
+
+On `brave://extensions`, open **Service worker** for this extension. The console logs save / remove / restore actions prefixed with `[Pin Tab Extension]`. After pulling an update, click **Reload** on the extension card before retesting.
