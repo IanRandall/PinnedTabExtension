@@ -4,14 +4,21 @@ Safari-style global pinned tabs for Brave and Chrome (Manifest V3).
 
 Pinned tab URLs are saved in `chrome.storage.local` and restored as pinned tabs in every normal browser window. Unpinning or closing a pinned tab while the browser is still open removes it from the saved set. Closing the last window does **not** clear the set.
 
-## Load unpacked in Brave
+## Install from release
 
-1. Open `brave://extensions` (or **Menu → Extensions → Manage extensions**).
-2. Turn on **Developer mode** (top right).
-3. Click **Load unpacked**.
-4. Select this repository folder (the one that contains `manifest.json`).
+1. Download **`pin-tab-extension-v1.0.1.zip`** from the [latest GitHub Release](https://github.com/IanRandall/PinnedTabExtension/releases/latest).
+2. Unzip the file (you should get a folder containing `manifest.json`).
+3. Open `brave://extensions` (or **Menu → Extensions → Manage extensions**).
+4. Turn on **Developer mode** (top right).
+5. Click **Load unpacked** and select the unzipped folder.
 
 The same steps work in Chrome via `chrome://extensions`.
+
+## Load unpacked from source
+
+1. Clone or download this repository.
+2. Open `brave://extensions` → **Developer mode** → **Load unpacked**.
+3. Select this repository folder (the one that contains `manifest.json`).
 
 ## How it works
 
