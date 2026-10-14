@@ -4,6 +4,8 @@ Safari-style global pinned tabs for Brave and Chrome (Manifest V3).
 
 Pinned tab URLs are saved in `chrome.storage.local` and restored as pinned tabs in every normal browser window. Unpinning or closing a pinned tab while the browser is still open removes it from the saved set. Closing the last window does **not** clear the set.
 
+Privacy: see [PRIVACY.md](PRIVACY.md).
+
 ## Install from release
 
 1. Open the [latest GitHub Release](https://github.com/IanRandall/ProperPinnedTabs/releases/latest) and download the latest `.zip` asset.
