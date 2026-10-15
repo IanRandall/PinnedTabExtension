@@ -42,10 +42,21 @@ Privacy: see [PRIVACY.md](PRIVACY.md).
 | File | Role |
 |------|------|
 | `manifest.json` | MV3 manifest (`tabs`, `storage`, service worker) |
-| `background.js` | Pin storage + restore logic |
+| `background.js` | Pin storage + restore logic (ES module) |
+| `lib/pin-logic.js` | Pure pin/storage/restore rules (unit-tested) |
 | `icons/` | Extension icons |
 
 No popup, options page, or sync in v1.
+
+## Tests
+
+Requires Node 18+ (uses the built-in test runner; no install step).
+
+```bash
+npm test
+```
+
+Covers pin/unpin/close storage rules, restore planning (including no resurrection after close, no wipe of navigated pins), restricted URLs, and normalization edge cases. CI runs the same command on pull requests and pushes to `main`.
 
 ## Debugging
 

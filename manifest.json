@@ -2,11 +2,12 @@
   "manifest_version": 3,
   "name": "Proper Pinned Tabs",
   "short_name": "Proper Pinned Tabs",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Safari-style global pinned tabs: save pinned URLs and restore them in every normal window.",
   "permissions": ["tabs", "storage"],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "icons": {
     "16": "icons/icon16.png",

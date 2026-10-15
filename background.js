@@ -12,6 +12,19 @@
  * the same storage entry.
  */
 
+import {
+  addPinToList,
+  dedupeUrlList,
+  isRestrictedUrl,
+  isWindowAlreadySatisfied,
+  normalizeUrlKey,
+  pickUsableUrl,
+  planRestore,
+  removePinFromList,
+  shouldPersistNavigatedUrl,
+  shouldRemoveOnTabClosed,
+} from "./lib/pin-logic.js";
+
 const STORAGE_KEY = "pinnedUrls";
 /** tabId(string) → storage URL key; survives SW restarts within the browser session. */
 const BINDINGS_KEY = "pinTabBindings";
@@ -54,6 +67,16 @@ const restoreSatisfiedAt = new Map();
 /** windowId → settle timeout id (keeps restoringDepth elevated briefly). */
 const restoreSettleTimers = new Map();
 
+/**
+ * Keys the user closed/unpinned this session. Restore must not recreate them
+ * (even if a concurrent restore already read stale storage, or SW retries fire).
+ */
+const recentlyClosedKeys = new Map(); // key → timestamp
+const CLOSED_SUPPRESS_MS = 120000;
+
+/** Bumped on user close/unpin so in-flight restores abort creating tabs. */
+let restoreGeneration = 0;
+
 function log(...args) {
   console.log(LOG_PREFIX, ...args);
 }
@@ -64,96 +87,6 @@ function warn(...args) {
 
 function isRestoring() {
   return restoringDepth > 0;
-}
-
-/** Restricted schemes that extensions cannot open. */
-function isRestrictedUrl(url) {
-  if (!url || typeof url !== "string") return true;
-  try {
-    const u = new URL(url);
-    const scheme = u.protocol.toLowerCase();
-    return (
-      scheme === "chrome:" ||
-      scheme === "chrome-extension:" ||
-      scheme === "chrome-search:" ||
-      scheme === "chrome-untrusted:" ||
-      scheme === "brave:" ||
-      scheme === "edge:" ||
-      scheme === "about:" ||
-      scheme === "devtools:" ||
-      scheme === "view-source:" ||
-      scheme === "data:" ||
-      scheme === "blob:" ||
-      scheme === "file:"
-    );
-  } catch {
-    return true;
-  }
-}
-
-/**
- * Canonical key for dedupe/matching across trailing slash, http/https,
- * default ports, and hash differences. Query string is kept (meaningful).
- */
-function normalizeUrlKey(url) {
-  if (!url || typeof url !== "string") return null;
-  try {
-    const u = new URL(url);
-    if (isRestrictedUrl(url)) return null;
-    let path = u.pathname || "/";
-    if (path.length > 1 && path.endsWith("/")) {
-      path = path.slice(0, -1);
-    }
-    const host = u.hostname.toLowerCase();
-    return `${host}${path}${u.search}`;
-  } catch {
-    return null;
-  }
-}
-
-/** Prefer https when rewriting a stored URL for tabs.create. */
-function canonicalStoredUrl(url) {
-  try {
-    const u = new URL(url);
-    let path = u.pathname || "/";
-    if (path.length > 1 && path.endsWith("/")) {
-      path = path.slice(0, -1);
-    }
-    const protocol =
-      u.protocol === "http:" || u.protocol === "https:" ? "https:" : u.protocol;
-    const port =
-      u.port && u.port !== "80" && u.port !== "443" ? `:${u.port}` : "";
-    return `${protocol}//${u.hostname.toLowerCase()}${port}${path}${u.search}`;
-  } catch {
-    return url;
-  }
-}
-
-function pickUsableUrl(tab) {
-  if (!tab) return null;
-  for (const candidate of [tab.url, tab.pendingUrl]) {
-    if (candidate && !isRestrictedUrl(candidate)) return candidate;
-  }
-  return null;
-}
-
-function tabMatchKey(tab) {
-  const url = pickUsableUrl(tab);
-  return url ? normalizeUrlKey(url) : null;
-}
-
-/** Dedupe by normalized key; preserve first-seen order; rewrite to canonical. */
-function dedupeUrlList(urls) {
-  const seen = new Set();
-  const out = [];
-  for (const raw of urls) {
-    if (!raw || isRestrictedUrl(raw)) continue;
-    const key = normalizeUrlKey(raw);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(canonicalStoredUrl(raw));
-  }
-  return out;
 }
 
 async function getPinnedUrls() {
@@ -229,34 +162,73 @@ async function addPinnedUrl(url, reason) {
     log("save skipped (restoring):", url, reason || "");
     return null;
   }
-  if (!url || isRestrictedUrl(url)) {
+  const urls = await getPinnedUrls();
+  const { list, key, added } = addPinToList(urls, url);
+  if (!key) {
     warn("skip save: restricted or empty URL", url);
     return null;
   }
-  const key = normalizeUrlKey(url);
-  if (!key) return null;
-
-  const urls = await getPinnedUrls();
-  if (urls.some((u) => normalizeUrlKey(u) === key)) {
+  if (!added) {
     log("save skipped (already stored):", url, "key=", key);
     return key;
   }
-  urls.push(canonicalStoredUrl(url));
-  await setPinnedUrls(urls);
+  await setPinnedUrls(list);
   log("saved pin:", url, "key=", key, reason || "");
   return key;
+}
+
+function noteClosedKey(key) {
+  if (!key) return;
+  const norm = normalizeUrlKey(key) || key;
+  recentlyClosedKeys.set(norm, Date.now());
+  restoreGeneration += 1;
+  // Force future restores to re-evaluate (do not treat window as satisfied).
+  restoreSatisfiedAt.clear();
+  log("suppress recreate for closed key", norm, "gen=", restoreGeneration);
+}
+
+function clearClosedKey(key) {
+  if (!key) return;
+  const norm = normalizeUrlKey(key) || key;
+  recentlyClosedKeys.delete(norm);
+}
+
+function suppressedKeyList() {
+  const now = Date.now();
+  const out = [];
+  for (const [key, ts] of recentlyClosedKeys) {
+    if (now - ts > CLOSED_SUPPRESS_MS) {
+      recentlyClosedKeys.delete(key);
+    } else {
+      out.push(key);
+    }
+  }
+  return out;
+}
+
+function isSuppressedKey(key) {
+  if (!key) return false;
+  const norm = normalizeUrlKey(key) || key;
+  const ts = recentlyClosedKeys.get(norm);
+  if (!ts) return false;
+  if (Date.now() - ts > CLOSED_SUPPRESS_MS) {
+    recentlyClosedKeys.delete(norm);
+    return false;
+  }
+  return true;
 }
 
 async function removePinnedUrl(urlOrKey, reason) {
   if (!urlOrKey) return;
   const key = normalizeUrlKey(urlOrKey) || urlOrKey;
+  noteClosedKey(key);
   const urls = await getPinnedUrls();
-  const next = urls.filter((u) => normalizeUrlKey(u) !== key);
-  if (next.length === urls.length) {
+  const { list, removed } = removePinFromList(urls, urlOrKey);
+  if (!removed) {
     log("remove skipped (not in storage):", urlOrKey, reason || "");
     return;
   }
-  await setPinnedUrls(next);
+  await setPinnedUrls(list);
   log("removed pin:", urlOrKey, reason || "");
 }
 
@@ -315,227 +287,150 @@ async function restorePinsInWindow(windowId) {
   }
 
   const flight = (async () => {
+    const genAtStart = restoreGeneration;
     const win = await chrome.windows.get(windowId).catch(() => null);
     if (!win || win.type !== "normal") {
       log("restore skip: window missing or not normal", windowId, win?.type);
       return;
     }
 
-    const saved = dedupeUrlList(await getPinnedUrls());
-    log("restore window", windowId, "saved=", saved);
+    const suppressed = suppressedKeyList();
+    const savedRaw = dedupeUrlList(await getPinnedUrls());
+    const saved = savedRaw.filter((u) => {
+      const key = normalizeUrlKey(u);
+      return key && !isSuppressedKey(key);
+    });
+    log("restore window", windowId, "saved=", saved, "suppressed=", suppressed);
     if (saved.length === 0) {
       restoreSatisfiedAt.set(windowId, Date.now());
       return;
     }
 
-    const savedKeys = saved
-      .map((u) => normalizeUrlKey(u))
-      .filter(Boolean);
-    const savedKeySet = new Set(savedKeys);
-
-    // Skip if this window was already fully restored recently and still covered.
-    const lastDone = restoreSatisfiedAt.get(windowId);
-    if (lastDone && Date.now() - lastDone < 10000) {
-      const tabsQuick = await chrome.tabs.query({ windowId, pinned: true });
-      const bindingsQuick = await getBindings();
-      const coveredQuick = new Set();
-      for (const tab of tabsQuick) {
-        const bound = bindingsQuick[String(tab.id)];
-        if (bound && savedKeySet.has(bound)) coveredQuick.add(bound);
-        else {
-          const k = tabMatchKey(tab);
-          if (k && savedKeySet.has(k)) coveredQuick.add(k);
-        }
-      }
-      if (
-        coveredQuick.size >= savedKeys.length ||
-        tabsQuick.length >= savedKeys.length
-      ) {
-        log(
-          "restore skip: window already satisfied",
-          windowId,
-          "pins=",
-          tabsQuick.length,
-          "covered=",
-          coveredQuick.size
-        );
-        return;
-      }
+    const bindings = await getBindings();
+    const pinnedTabs = await chrome.tabs.query({ windowId, pinned: true });
+    if (
+      isWindowAlreadySatisfied({
+        savedUrls: saved,
+        pinnedTabs,
+        bindings,
+        lastSatisfiedAt: restoreSatisfiedAt.get(windowId) || 0,
+      })
+    ) {
+      log(
+        "restore skip: window already satisfied",
+        windowId,
+        "pins=",
+        pinnedTabs.length
+      );
+      return;
     }
 
     beginRestoreGuard(windowId);
     try {
-      let tabs = await chrome.tabs.query({ windowId });
-      let bindings = await getBindings();
+      const tabs = await chrome.tabs.query({ windowId });
+      const plan = planRestore({
+        savedUrls: saved,
+        tabs,
+        bindings,
+        suppressedKeys: suppressed,
+      });
+      log(
+        "restore plan",
+        windowId,
+        "actions=",
+        plan.actions.map((a) => a.type),
+        "reason=",
+        plan.skipReason
+      );
 
-      // Drop stale bindings for tabs that no longer exist in this window.
-      const liveIds = new Set(tabs.map((t) => String(t.id)));
-      let bindingsDirty = false;
-      for (const id of Object.keys(bindings)) {
-        if (!liveIds.has(id)) {
-          delete bindings[id];
-          bindingsDirty = true;
+      for (const action of plan.actions) {
+        if (restoreGeneration !== genAtStart) {
+          log("restore aborted: generation changed (user closed a pin)");
+          break;
         }
-      }
-      if (bindingsDirty) await setBindings(bindings);
-
-      /** storageKey → pinned tab already bound or URL-matched */
-      const pinnedByStorageKey = new Map();
-      const unboundPinned = [];
-
-      for (const tab of tabs) {
-        if (!tab.pinned || tab.id == null) continue;
-        const bound = bindings[String(tab.id)];
-        if (bound && savedKeySet.has(bound)) {
-          if (!pinnedByStorageKey.has(bound)) {
-            pinnedByStorageKey.set(bound, tab);
-          }
-          pinnedTabCache.set(tab.id, {
-            url: pickUsableUrl(tab),
-            key: bound,
-          });
-          continue;
-        }
-        const urlKey = tabMatchKey(tab);
-        if (urlKey && savedKeySet.has(urlKey) && !pinnedByStorageKey.has(urlKey)) {
-          pinnedByStorageKey.set(urlKey, tab);
-          await bindTabToKey(tab.id, urlKey, pickUsableUrl(tab));
-          bindings[String(tab.id)] = urlKey;
-          continue;
-        }
-        unboundPinned.push(tab);
-      }
-
-      // If we already have enough pinned tabs for the saved set, bind leftover
-      // saved keys to unbound navigated pins — do NOT create or navigate.
-      if (
-        pinnedByStorageKey.size + unboundPinned.length >= savedKeys.length &&
-        pinnedByStorageKey.size < savedKeys.length
-      ) {
-        for (const key of savedKeys) {
-          if (pinnedByStorageKey.has(key)) continue;
-          const tab = unboundPinned.shift();
-          if (!tab) break;
-          await bindTabToKey(tab.id, key, pickUsableUrl(tab));
-          bindings[String(tab.id)] = key;
-          pinnedByStorageKey.set(key, tab);
-          log("restore: bound navigated pin to storage key", key, tab.id);
-        }
-      }
-
-      if (pinnedByStorageKey.size >= savedKeys.length) {
-        restoreSatisfiedAt.set(windowId, Date.now());
-        log(
-          "restore done (already covered) window",
-          windowId,
-          "covered=",
-          pinnedByStorageKey.size,
-          "/",
-          savedKeys.length
-        );
-        return;
-      }
-
-      // Refresh tabs/bindings after possible binds.
-      tabs = await chrome.tabs.query({ windowId });
-      bindings = await getBindings();
-
-      let insertIndex = 0;
-      for (const url of saved) {
-        const key = normalizeUrlKey(url);
-        if (!key) continue;
-
-        const already = pinnedByStorageKey.get(key);
-        if (already) {
-          // Do not navigate/reload. Optional reorder only.
-          if (already.index !== insertIndex) {
-            try {
-              await chrome.tabs.move(already.id, { index: insertIndex });
-            } catch (err) {
-              warn("Failed to reorder pin:", key, err);
-            }
-          }
-          insertIndex += 1;
-          continue;
-        }
-
-        // Prefer pinning an existing unpinned tab with this URL (e.g. history)
-        // instead of creating a duplicate tab — only when this slot is missing.
-        const unpinnedMatch = tabs.find(
-          (t) =>
-            !t.pinned &&
-            t.id != null &&
-            tabMatchKey(t) === key &&
-            !bindings[String(t.id)]
-        );
-        if (unpinnedMatch) {
-          try {
-            await chrome.tabs.update(unpinnedMatch.id, { pinned: true });
-            await chrome.tabs.move(unpinnedMatch.id, { index: insertIndex });
-            await bindTabToKey(unpinnedMatch.id, key, pickUsableUrl(unpinnedMatch));
-            pinnedByStorageKey.set(key, unpinnedMatch);
-            log("restore: pinned existing unpinned tab", url, "key=", key);
-          } catch (err) {
-            warn("Failed to pin existing tab:", url, err);
-          }
-          insertIndex += 1;
-          continue;
-        }
-
         try {
-          const created = await chrome.tabs.create({
-            windowId,
-            url: canonicalStoredUrl(url),
-            pinned: true,
-            active: false,
-            index: insertIndex,
-          });
-          if (created.id != null) {
-            await bindTabToKey(created.id, key, url);
-            pinnedByStorageKey.set(key, created);
+          if (action.type === "bind") {
+            if (isSuppressedKey(action.key)) continue;
+            const tab = tabs.find((t) => t.id === action.tabId);
+            await bindTabToKey(
+              action.tabId,
+              action.key,
+              pickUsableUrl(tab) || null
+            );
+          } else if (action.type === "pin") {
+            if (isSuppressedKey(action.key)) continue;
+            // Re-check storage — user may have closed this pin mid-restore.
+            const stillSaved = (await getPinnedUrls()).some(
+              (u) => normalizeUrlKey(u) === action.key
+            );
+            if (!stillSaved) {
+              log("restore skip pin: no longer in storage", action.key);
+              continue;
+            }
+            await chrome.tabs.update(action.tabId, { pinned: true });
+            if (action.index != null) {
+              await chrome.tabs.move(action.tabId, { index: action.index });
+            }
+            const tab = tabs.find((t) => t.id === action.tabId);
+            await bindTabToKey(
+              action.tabId,
+              action.key,
+              pickUsableUrl(tab) || null
+            );
+            log("restore: pinned existing unpinned tab", action.key);
+          } else if (action.type === "create") {
+            if (isSuppressedKey(action.key)) {
+              log("restore skip create: suppressed", action.key);
+              continue;
+            }
+            const stillSaved = (await getPinnedUrls()).some(
+              (u) => normalizeUrlKey(u) === action.key
+            );
+            if (!stillSaved) {
+              log("restore skip create: no longer in storage", action.key);
+              continue;
+            }
+            if (restoreGeneration !== genAtStart) {
+              log("restore skip create: generation changed", action.key);
+              break;
+            }
+            const created = await chrome.tabs.create({
+              windowId,
+              url: action.url,
+              pinned: true,
+              active: false,
+              index: action.index,
+            });
+            if (created.id != null) {
+              await bindTabToKey(created.id, action.key, action.url);
+            }
+            log("restore: created pinned tab", action.url, "key=", action.key);
+          } else if (action.type === "move") {
+            await chrome.tabs.move(action.tabId, { index: action.index });
+          } else if (action.type === "removeDuplicate") {
+            await unbindTab(action.tabId);
+            await chrome.tabs.remove(action.tabId);
+            log(
+              "restore: removed duplicate pin for key",
+              action.key,
+              action.tabId
+            );
           }
-          log("restore: created pinned tab", url, "key=", key);
-          insertIndex += 1;
         } catch (err) {
-          warn("Failed to create pinned tab:", url, err);
+          warn("restore action failed", action, err);
         }
       }
 
-      // Dedupe only: multiple tabs bound to the same storage key (keep first).
-      // Never close a pin merely because its current URL ≠ stored URL.
-      tabs = await chrome.tabs.query({ windowId, pinned: true });
-      bindings = await getBindings();
-      /** @type {Map<string, number[]>} */
-      const idsByKey = new Map();
-      for (const tab of tabs) {
-        if (tab.id == null) continue;
-        const key = bindings[String(tab.id)];
-        if (!key || !savedKeySet.has(key)) continue;
-        if (!idsByKey.has(key)) idsByKey.set(key, []);
-        idsByKey.get(key).push(tab.id);
+      if (restoreGeneration === genAtStart) {
+        restoreSatisfiedAt.set(windowId, Date.now());
       }
-      for (const [key, ids] of idsByKey) {
-        if (ids.length <= 1) continue;
-        const [, ...extras] = ids;
-        for (const id of extras) {
-          try {
-            await unbindTab(id);
-            await chrome.tabs.remove(id);
-            log("restore: removed duplicate pin for key", key, id);
-          } catch (err) {
-            warn("Failed to remove duplicate pin", key, id, err);
-          }
-        }
-      }
-
-      restoreSatisfiedAt.set(windowId, Date.now());
       log(
         "restore done window",
         windowId,
         "covered=",
-        pinnedByStorageKey.size,
+        plan.coveredKeys.length,
         "/",
-        savedKeys.length
+        saved.length
       );
     } finally {
       endRestoreGuard(windowId);
@@ -569,18 +464,35 @@ async function restorePinsInAllNormalWindows() {
 const scheduledReasons = new Set();
 
 /**
- * Startup/session restore races: windows or tabs may not exist yet when
- * onStartup fires. Retries are idempotent and skip when already satisfied.
+ * Schedule restore sparingly. Aggressive multi-timer retries fought user closes
+ * and were implicated in a Brave main-thread crash (CFRunLoop timer / tab thrash).
+ *
+ * - onStartup: one deferred pass + one late pass for session restore
+ * - windows.onCreated: single short defer (tab strip ready)
+ * - onInstalled: single pass
+ * - service-worker-start: NO restore — mid-session SW wakes must not thrash
  */
 function scheduleRestoreRetries(reason, windowId = null) {
+  if (reason === "service-worker-start") {
+    log("skip restore on SW start (avoid timer thrash / close races)");
+    return;
+  }
   if (scheduledReasons.has(reason)) {
-    log("restore retries already scheduled for", reason);
+    log("restore already scheduled for", reason);
     return;
   }
   scheduledReasons.add(reason);
-  log("schedule restore retries:", reason, "windowId=", windowId);
 
-  const delays = [0, 500, 1500, 3000];
+  let delays;
+  if (reason === "onStartup") {
+    delays = [600, 2500];
+  } else if (String(reason).startsWith("windows.onCreated")) {
+    delays = [400];
+  } else {
+    delays = [0];
+  }
+
+  log("schedule restore:", reason, "delays=", delays, "windowId=", windowId);
   let remaining = delays.length;
   for (const ms of delays) {
     setTimeout(() => {
@@ -589,7 +501,7 @@ function scheduleRestoreRetries(reason, windowId = null) {
           ? restorePinsInWindow(windowId)
           : restorePinsInAllNormalWindows();
       Promise.resolve(run)
-        .catch((err) => warn("restore retry failed:", err))
+        .catch((err) => warn("restore failed:", err))
         .finally(() => {
           remaining -= 1;
           if (remaining <= 0) scheduledReasons.delete(reason);
@@ -606,6 +518,8 @@ function scheduleRestoreRetries(reason, windowId = null) {
 async function recordUserPin(tabId, tab) {
   const pinUrl = await resolveTabUrl(tabId, tab);
   if (pinUrl) {
+    const maybeKey = normalizeUrlKey(pinUrl);
+    if (maybeKey) clearClosedKey(maybeKey);
     const key = await addPinnedUrl(pinUrl, "user pin");
     if (key) await bindTabToKey(tabId, key, pinUrl);
     else {
@@ -625,11 +539,18 @@ async function recordUserPin(tabId, tab) {
 }
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  const awaiting = awaitingPinUrl.has(tabId);
+  const mayPersist = shouldPersistNavigatedUrl({
+    isRestoring: isRestoring(),
+    sessionEnding,
+    awaitingFirstPinUrl: awaiting,
+    changePinned: changeInfo.pinned,
+  });
+
   // First usable URL after a user pin with no URL yet → save once.
   if (
-    awaitingPinUrl.has(tabId) &&
-    !isRestoring() &&
-    !sessionEnding &&
+    awaiting &&
+    mayPersist &&
     (changeInfo.url || changeInfo.status === "complete" || tab.url)
   ) {
     const url = await resolveTabUrl(tabId, tab);
@@ -671,7 +592,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     awaitingPinUrl.delete(tabId);
     if (!(await browserStillOpen())) {
       log("ignore unpin: browser not open / session ending", tabId);
-      await unbindTab(tabId);
+      // Keep bindings so a late onRemoved can still decide; session end preserves.
       return;
     }
     let stillExists = true;
@@ -681,11 +602,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       stillExists = false;
     }
     if (!stillExists) {
-      log("ignore unpin: tab already gone (teardown)", tabId);
-      await unbindTab(tabId);
+      // Closing a pinned tab often fires pinned→false after the tab is gone.
+      // Do NOT unbind or remove here — that raced onRemoved and left stale
+      // pinnedUrls (pins reappeared in a new window). Let onRemoved handle it.
+      log("ignore unpin: tab closing; defer remove to onRemoved", tabId);
       return;
     }
 
+    // Explicit user unpin (tab still open).
     const cached = pinnedTabCache.get(tabId);
     const bindings = await getBindings();
     const unpinKey =
@@ -694,6 +618,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       (await resolveTabUrl(tabId, tab));
     await unbindTab(tabId);
     if (unpinKey) {
+      clearClosedKey(unpinKey); // will re-note inside removePinnedUrl
       await removePinnedUrl(unpinKey, "user unpin");
     }
   }
@@ -701,31 +626,36 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   awaitingPinUrl.delete(tabId);
+  // Read key BEFORE unbind — unpin-on-close used to clear bindings first and
+  // then onRemoved had nothing to remove from storage.
   const cached = pinnedTabCache.get(tabId);
   const bindings = await getBindings();
-  const key = cached?.key || bindings[String(tabId)] || cached?.url;
-  await unbindTab(tabId);
+  const key = cached?.key || bindings[String(tabId)] || cached?.url || null;
 
   if (!key) {
-    return;
-  }
-  if (isRestoring()) {
-    log("ignore remove while restoring", key);
+    await unbindTab(tabId);
+    log("onRemoved: no pin key for tab", tabId, "— storage unchanged");
     return;
   }
 
-  if (removeInfo.isWindowClosing || sessionEnding) {
+  const stillOpen = await browserStillOpen();
+  const shouldRemove = shouldRemoveOnTabClosed({
+    sessionEnding,
+    isWindowClosing: !!removeInfo.isWindowClosing,
+    browserStillOpen: stillOpen,
+  });
+
+  await unbindTab(tabId);
+
+  if (!shouldRemove) {
     log(
-      "preserve pin on window/session close:",
+      "preserve pin on close:",
       key,
       "isWindowClosing=",
-      removeInfo.isWindowClosing
+      removeInfo.isWindowClosing,
+      "sessionEnding=",
+      sessionEnding
     );
-    return;
-  }
-
-  if (!(await browserStillOpen())) {
-    log("preserve pin: no windows left:", key);
     return;
   }
 
