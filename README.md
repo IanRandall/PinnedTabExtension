@@ -6,20 +6,27 @@ Pinned tab URLs are saved in `chrome.storage.local` and restored as pinned tabs 
 
 Privacy: see [PRIVACY.md](PRIVACY.md).
 
-## Install from release
+## Install (recommended)
 
-1. Open the [latest GitHub Release](https://github.com/IanRandall/ProperPinnedTabs/releases/latest) and download the latest `.zip` asset.
-2. Unzip the file (you should get a folder containing `manifest.json`).
-3. Open `brave://extensions` (or **Menu → Extensions → Manage extensions**).
-4. Turn on **Developer mode** (top right).
-5. Click **Load unpacked** and select the unzipped folder.
+**Chrome Web Store** — works in Chrome and Brave:
 
-The same steps work in Chrome via `chrome://extensions`.
+1. Open [Proper Pinned Tabs on the Chrome Web Store](https://chromewebstore.google.com/detail/proper-pinned-tabs/ppoaagcjajlmahlocfkbcgjdoffhmpen).
+2. Click **Add to Chrome** (in Brave the button may say **Add to Brave** / **Install**).
+3. Confirm when prompted.
 
-## Load unpacked from source
+## Alternatives (developers / offline)
+
+### GitHub release (load unpacked)
+
+1. Download the latest `.zip` from [Releases](https://github.com/IanRandall/ProperPinnedTabs/releases/latest).
+2. Unzip it (you should get a folder containing `manifest.json`).
+3. Open `brave://extensions` or `chrome://extensions`.
+4. Turn on **Developer mode** → **Load unpacked** → select the unzipped folder.
+
+### From source
 
 1. Clone or download this repository.
-2. Open `brave://extensions` → **Developer mode** → **Load unpacked**.
+2. Open `brave://extensions` or `chrome://extensions` → **Developer mode** → **Load unpacked**.
 3. Select this repository folder (the one that contains `manifest.json`).
 
 ## How it works
@@ -42,4 +49,4 @@ No popup, options page, or sync in v1.
 
 ## Debugging
 
-On `brave://extensions`, open **Service worker** for this extension. The console logs save / remove / restore actions prefixed with `[Proper Pinned Tabs]`. After pulling an update, click **Reload** on the extension card before retesting.
+On `brave://extensions` (or `chrome://extensions`), open **Service worker** for this extension. The console logs save / remove / restore actions prefixed with `[Proper Pinned Tabs]`. After updating a load-unpacked build, click **Reload** on the extension card before retesting.
