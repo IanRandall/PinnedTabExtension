@@ -56,7 +56,7 @@ Requires Node 18+ (uses the built-in test runner; no install step).
 npm test
 ```
 
-CI runs the same command on pull requests and pushes to `main`.
+Covers pin/unpin/close storage rules, restore planning (including no resurrection after close, no wipe of navigated pins), restricted URLs, and normalization edge cases. CI runs the same command on pull requests and pushes to `main`.
 
 ## Debugging
 

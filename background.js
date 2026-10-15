@@ -67,6 +67,16 @@ const restoreSatisfiedAt = new Map();
 /** windowId → settle timeout id (keeps restoringDepth elevated briefly). */
 const restoreSettleTimers = new Map();
 
+/**
+ * Keys the user closed/unpinned this session. Restore must not recreate them
+ * (even if a concurrent restore already read stale storage, or SW retries fire).
+ */
+const recentlyClosedKeys = new Map(); // key → timestamp
+const CLOSED_SUPPRESS_MS = 120000;
+
+/** Bumped on user close/unpin so in-flight restores abort creating tabs. */
+let restoreGeneration = 0;
+
 function log(...args) {
   console.log(LOG_PREFIX, ...args);
 }
@@ -167,8 +177,51 @@ async function addPinnedUrl(url, reason) {
   return key;
 }
 
+function noteClosedKey(key) {
+  if (!key) return;
+  const norm = normalizeUrlKey(key) || key;
+  recentlyClosedKeys.set(norm, Date.now());
+  restoreGeneration += 1;
+  // Force future restores to re-evaluate (do not treat window as satisfied).
+  restoreSatisfiedAt.clear();
+  log("suppress recreate for closed key", norm, "gen=", restoreGeneration);
+}
+
+function clearClosedKey(key) {
+  if (!key) return;
+  const norm = normalizeUrlKey(key) || key;
+  recentlyClosedKeys.delete(norm);
+}
+
+function suppressedKeyList() {
+  const now = Date.now();
+  const out = [];
+  for (const [key, ts] of recentlyClosedKeys) {
+    if (now - ts > CLOSED_SUPPRESS_MS) {
+      recentlyClosedKeys.delete(key);
+    } else {
+      out.push(key);
+    }
+  }
+  return out;
+}
+
+function isSuppressedKey(key) {
+  if (!key) return false;
+  const norm = normalizeUrlKey(key) || key;
+  const ts = recentlyClosedKeys.get(norm);
+  if (!ts) return false;
+  if (Date.now() - ts > CLOSED_SUPPRESS_MS) {
+    recentlyClosedKeys.delete(norm);
+    return false;
+  }
+  return true;
+}
+
 async function removePinnedUrl(urlOrKey, reason) {
   if (!urlOrKey) return;
+  const key = normalizeUrlKey(urlOrKey) || urlOrKey;
+  noteClosedKey(key);
   const urls = await getPinnedUrls();
   const { list, removed } = removePinFromList(urls, urlOrKey);
   if (!removed) {
@@ -234,14 +287,20 @@ async function restorePinsInWindow(windowId) {
   }
 
   const flight = (async () => {
+    const genAtStart = restoreGeneration;
     const win = await chrome.windows.get(windowId).catch(() => null);
     if (!win || win.type !== "normal") {
       log("restore skip: window missing or not normal", windowId, win?.type);
       return;
     }
 
-    const saved = dedupeUrlList(await getPinnedUrls());
-    log("restore window", windowId, "saved=", saved);
+    const suppressed = suppressedKeyList();
+    const savedRaw = dedupeUrlList(await getPinnedUrls());
+    const saved = savedRaw.filter((u) => {
+      const key = normalizeUrlKey(u);
+      return key && !isSuppressedKey(key);
+    });
+    log("restore window", windowId, "saved=", saved, "suppressed=", suppressed);
     if (saved.length === 0) {
       restoreSatisfiedAt.set(windowId, Date.now());
       return;
@@ -269,7 +328,12 @@ async function restorePinsInWindow(windowId) {
     beginRestoreGuard(windowId);
     try {
       const tabs = await chrome.tabs.query({ windowId });
-      const plan = planRestore({ savedUrls: saved, tabs, bindings });
+      const plan = planRestore({
+        savedUrls: saved,
+        tabs,
+        bindings,
+        suppressedKeys: suppressed,
+      });
       log(
         "restore plan",
         windowId,
@@ -279,10 +343,14 @@ async function restorePinsInWindow(windowId) {
         plan.skipReason
       );
 
-      /** Newly created tabs need bind after create (plan.create has no tabId yet). */
       for (const action of plan.actions) {
+        if (restoreGeneration !== genAtStart) {
+          log("restore aborted: generation changed (user closed a pin)");
+          break;
+        }
         try {
           if (action.type === "bind") {
+            if (isSuppressedKey(action.key)) continue;
             const tab = tabs.find((t) => t.id === action.tabId);
             await bindTabToKey(
               action.tabId,
@@ -290,6 +358,15 @@ async function restorePinsInWindow(windowId) {
               pickUsableUrl(tab) || null
             );
           } else if (action.type === "pin") {
+            if (isSuppressedKey(action.key)) continue;
+            // Re-check storage — user may have closed this pin mid-restore.
+            const stillSaved = (await getPinnedUrls()).some(
+              (u) => normalizeUrlKey(u) === action.key
+            );
+            if (!stillSaved) {
+              log("restore skip pin: no longer in storage", action.key);
+              continue;
+            }
             await chrome.tabs.update(action.tabId, { pinned: true });
             if (action.index != null) {
               await chrome.tabs.move(action.tabId, { index: action.index });
@@ -302,6 +379,21 @@ async function restorePinsInWindow(windowId) {
             );
             log("restore: pinned existing unpinned tab", action.key);
           } else if (action.type === "create") {
+            if (isSuppressedKey(action.key)) {
+              log("restore skip create: suppressed", action.key);
+              continue;
+            }
+            const stillSaved = (await getPinnedUrls()).some(
+              (u) => normalizeUrlKey(u) === action.key
+            );
+            if (!stillSaved) {
+              log("restore skip create: no longer in storage", action.key);
+              continue;
+            }
+            if (restoreGeneration !== genAtStart) {
+              log("restore skip create: generation changed", action.key);
+              break;
+            }
             const created = await chrome.tabs.create({
               windowId,
               url: action.url,
@@ -329,7 +421,9 @@ async function restorePinsInWindow(windowId) {
         }
       }
 
-      restoreSatisfiedAt.set(windowId, Date.now());
+      if (restoreGeneration === genAtStart) {
+        restoreSatisfiedAt.set(windowId, Date.now());
+      }
       log(
         "restore done window",
         windowId,
@@ -370,18 +464,35 @@ async function restorePinsInAllNormalWindows() {
 const scheduledReasons = new Set();
 
 /**
- * Startup/session restore races: windows or tabs may not exist yet when
- * onStartup fires. Retries are idempotent and skip when already satisfied.
+ * Schedule restore sparingly. Aggressive multi-timer retries fought user closes
+ * and were implicated in a Brave main-thread crash (CFRunLoop timer / tab thrash).
+ *
+ * - onStartup: one deferred pass + one late pass for session restore
+ * - windows.onCreated: single short defer (tab strip ready)
+ * - onInstalled: single pass
+ * - service-worker-start: NO restore — mid-session SW wakes must not thrash
  */
 function scheduleRestoreRetries(reason, windowId = null) {
+  if (reason === "service-worker-start") {
+    log("skip restore on SW start (avoid timer thrash / close races)");
+    return;
+  }
   if (scheduledReasons.has(reason)) {
-    log("restore retries already scheduled for", reason);
+    log("restore already scheduled for", reason);
     return;
   }
   scheduledReasons.add(reason);
-  log("schedule restore retries:", reason, "windowId=", windowId);
 
-  const delays = [0, 500, 1500, 3000];
+  let delays;
+  if (reason === "onStartup") {
+    delays = [600, 2500];
+  } else if (String(reason).startsWith("windows.onCreated")) {
+    delays = [400];
+  } else {
+    delays = [0];
+  }
+
+  log("schedule restore:", reason, "delays=", delays, "windowId=", windowId);
   let remaining = delays.length;
   for (const ms of delays) {
     setTimeout(() => {
@@ -390,7 +501,7 @@ function scheduleRestoreRetries(reason, windowId = null) {
           ? restorePinsInWindow(windowId)
           : restorePinsInAllNormalWindows();
       Promise.resolve(run)
-        .catch((err) => warn("restore retry failed:", err))
+        .catch((err) => warn("restore failed:", err))
         .finally(() => {
           remaining -= 1;
           if (remaining <= 0) scheduledReasons.delete(reason);
@@ -407,6 +518,8 @@ function scheduleRestoreRetries(reason, windowId = null) {
 async function recordUserPin(tabId, tab) {
   const pinUrl = await resolveTabUrl(tabId, tab);
   if (pinUrl) {
+    const maybeKey = normalizeUrlKey(pinUrl);
+    if (maybeKey) clearClosedKey(maybeKey);
     const key = await addPinnedUrl(pinUrl, "user pin");
     if (key) await bindTabToKey(tabId, key, pinUrl);
     else {
@@ -479,7 +592,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     awaitingPinUrl.delete(tabId);
     if (!(await browserStillOpen())) {
       log("ignore unpin: browser not open / session ending", tabId);
-      await unbindTab(tabId);
+      // Keep bindings so a late onRemoved can still decide; session end preserves.
       return;
     }
     let stillExists = true;
@@ -489,11 +602,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       stillExists = false;
     }
     if (!stillExists) {
-      log("ignore unpin: tab already gone (teardown)", tabId);
-      await unbindTab(tabId);
+      // Closing a pinned tab often fires pinned→false after the tab is gone.
+      // Do NOT unbind or remove here — that raced onRemoved and left stale
+      // pinnedUrls (pins reappeared in a new window). Let onRemoved handle it.
+      log("ignore unpin: tab closing; defer remove to onRemoved", tabId);
       return;
     }
 
+    // Explicit user unpin (tab still open).
     const cached = pinnedTabCache.get(tabId);
     const bindings = await getBindings();
     const unpinKey =
@@ -502,6 +618,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       (await resolveTabUrl(tabId, tab));
     await unbindTab(tabId);
     if (unpinKey) {
+      clearClosedKey(unpinKey); // will re-note inside removePinnedUrl
       await removePinnedUrl(unpinKey, "user unpin");
     }
   }
@@ -509,21 +626,26 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   awaitingPinUrl.delete(tabId);
+  // Read key BEFORE unbind — unpin-on-close used to clear bindings first and
+  // then onRemoved had nothing to remove from storage.
   const cached = pinnedTabCache.get(tabId);
   const bindings = await getBindings();
-  const key = cached?.key || bindings[String(tabId)] || cached?.url;
-  await unbindTab(tabId);
+  const key = cached?.key || bindings[String(tabId)] || cached?.url || null;
 
   if (!key) {
+    await unbindTab(tabId);
+    log("onRemoved: no pin key for tab", tabId, "— storage unchanged");
     return;
   }
 
+  const stillOpen = await browserStillOpen();
   const shouldRemove = shouldRemoveOnTabClosed({
-    isRestoring: isRestoring(),
     sessionEnding,
     isWindowClosing: !!removeInfo.isWindowClosing,
-    browserStillOpen: await browserStillOpen(),
+    browserStillOpen: stillOpen,
   });
+
+  await unbindTab(tabId);
 
   if (!shouldRemove) {
     log(
