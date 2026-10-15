@@ -3,10 +3,16 @@
  * Keeps an ordered URL set in chrome.storage.local and restores pins into
  * every normal window until the user unpins or closes a pinned tab while
  * the browser is still open. Closing the last window does not clear the set.
+ *
+ * Storage grows only on an explicit user pin (changeInfo.pinned === true),
+ * never from restore or from navigating inside an already-pinned tab.
  */
 
 const STORAGE_KEY = "pinnedUrls";
 const LOG_PREFIX = "[Proper Pinned Tabs]";
+
+/** Settle time so late create/navigation events stay under the restore guard. */
+const RESTORE_SETTLE_MS = 2000;
 
 /**
  * While > 0, ignore pin/unpin/storage writes from programmatic restore.
@@ -20,14 +26,27 @@ let restoringDepth = 0;
  */
 let sessionEnding = false;
 
-/** tabId → { url, key } for pinned tabs (onRemoved has no tab payload). */
+/**
+ * tabId → { url, key }
+ * `key` is the storage key captured at pin time and must NOT change when the
+ * pinned tab navigates (so unpin/close still removes the original entry).
+ */
 const pinnedTabCache = new Map();
+
+/**
+ * Tabs the user just pinned whose URL was not ready yet. Only these may
+ * write storage on a later URL commit — not every navigation of a pin.
+ */
+const awaitingPinUrl = new Set();
 
 /** windowId → in-flight restore Promise (retries coalesce). */
 const restoreInFlight = new Map();
 
 /** windowId → last successful restore timestamp (ms). */
 const restoreSatisfiedAt = new Map();
+
+/** windowId → settle timeout id (keeps restoringDepth elevated briefly). */
+const restoreSettleTimers = new Map();
 
 function log(...args) {
   console.log(LOG_PREFIX, ...args);
@@ -160,9 +179,9 @@ async function compactPinnedUrls() {
 }
 
 /** Add URL to the ordered list if not already present (dedupe by normalized key). */
-async function addPinnedUrl(url) {
+async function addPinnedUrl(url, reason) {
   if (isRestoring()) {
-    log("save skipped (restoring):", url);
+    log("save skipped (restoring):", url, reason || "");
     return;
   }
   if (!url || isRestrictedUrl(url)) {
@@ -179,22 +198,20 @@ async function addPinnedUrl(url) {
   }
   urls.push(canonicalStoredUrl(url));
   await setPinnedUrls(urls);
-  log("saved pin:", url, "key=", key);
+  log("saved pin:", url, "key=", key, reason || "");
 }
 
-async function removePinnedUrl(url, reason) {
-  if (!url) return;
-  const key = normalizeUrlKey(url);
+async function removePinnedUrl(urlOrKey, reason) {
+  if (!urlOrKey) return;
+  const key = normalizeUrlKey(urlOrKey) || urlOrKey;
   const urls = await getPinnedUrls();
-  const next = key
-    ? urls.filter((u) => normalizeUrlKey(u) !== key)
-    : urls.filter((u) => u !== url);
+  const next = urls.filter((u) => normalizeUrlKey(u) !== key);
   if (next.length === urls.length) {
-    log("remove skipped (not in storage):", url, reason || "");
+    log("remove skipped (not in storage):", urlOrKey, reason || "");
     return;
   }
   await setPinnedUrls(next);
-  log("removed pin:", url, reason || "");
+  log("removed pin:", urlOrKey, reason || "");
 }
 
 async function resolveTabUrl(tabId, tab) {
@@ -220,9 +237,28 @@ async function browserStillOpen() {
   }
 }
 
+function beginRestoreGuard(windowId) {
+  restoringDepth += 1;
+  const prev = restoreSettleTimers.get(windowId);
+  if (prev) clearTimeout(prev);
+}
+
+function endRestoreGuard(windowId) {
+  // Keep the guard up briefly so tabs.create navigation/pin events settle.
+  const prev = restoreSettleTimers.get(windowId);
+  if (prev) clearTimeout(prev);
+  const timer = setTimeout(() => {
+    restoreSettleTimers.delete(windowId);
+    restoringDepth = Math.max(0, restoringDepth - 1);
+    log("restore guard cleared for window", windowId, "depth=", restoringDepth);
+  }, RESTORE_SETTLE_MS);
+  restoreSettleTimers.set(windowId, timer);
+}
+
 /**
  * Ensure each saved URL is present as a pinned tab in the given window,
  * in stored order. Matching uses normalized URL keys. Idempotent / safe to retry.
+ * Never writes to chrome.storage.local.
  */
 async function restorePinsInWindow(windowId) {
   if (windowId == null) return;
@@ -247,9 +283,8 @@ async function restorePinsInWindow(windowId) {
       return;
     }
 
-    restoringDepth += 1;
+    beginRestoreGuard(windowId);
     try {
-      // Re-query tabs each pass so session-restored tabs are visible.
       let tabs = await chrome.tabs.query({ windowId });
 
       /** @type {Map<string, chrome.tabs.Tab>} */
@@ -279,6 +314,7 @@ async function restorePinsInWindow(windowId) {
         if (existing) {
           try {
             if (!existing.pinned) {
+              // Only pin an open tab when its URL exactly matches a saved pin.
               await chrome.tabs.update(existing.id, { pinned: true });
               log("restore: pinned existing tab", url, "key=", key);
             }
@@ -287,6 +323,7 @@ async function restorePinsInWindow(windowId) {
             }
             if (existing.id != null) {
               pinnedTabCache.set(existing.id, { url, key });
+              awaitingPinUrl.delete(existing.id);
             }
           } catch (err) {
             warn("Failed to adopt existing tab:", url, err);
@@ -306,6 +343,7 @@ async function restorePinsInWindow(windowId) {
           });
           if (created.id != null) {
             pinnedTabCache.set(created.id, { url, key });
+            awaitingPinUrl.delete(created.id);
             tabsByKey.set(key, created);
           }
           log("restore: created pinned tab", url, "key=", key);
@@ -316,8 +354,8 @@ async function restorePinsInWindow(windowId) {
         }
       }
 
-      // Refresh and close extra pinned tabs that duplicate a saved key
-      // (e.g. leftovers from older buggy restores). Keep the first by index.
+      // Remove extra pinned tabs that duplicate a saved key, and any pin whose
+      // URL is not in the saved set (leftovers from older buggy growth).
       tabs = await chrome.tabs.query({ windowId });
       const savedKeys = new Set(
         saved.map((u) => normalizeUrlKey(u)).filter(Boolean)
@@ -327,17 +365,29 @@ async function restorePinsInWindow(windowId) {
       for (const tab of tabs) {
         if (!tab.pinned || tab.id == null) continue;
         const key = tabMatchKey(tab);
-        if (!key || !savedKeys.has(key)) continue;
+        if (!key) continue;
+        if (!savedKeys.has(key)) {
+          // Orphan pin: not in storage — close it so browsing leftovers vanish.
+          try {
+            pinnedTabCache.delete(tab.id);
+            awaitingPinUrl.delete(tab.id);
+            await chrome.tabs.remove(tab.id);
+            log("restore: removed orphan pinned tab", key, tab.id);
+          } catch (err) {
+            warn("Failed to remove orphan pin", key, tab.id, err);
+          }
+          continue;
+        }
         if (!pinnedIdsByKey.has(key)) pinnedIdsByKey.set(key, []);
         pinnedIdsByKey.get(key).push(tab.id);
       }
       for (const [key, ids] of pinnedIdsByKey) {
         if (ids.length <= 1) continue;
-        // Keep the first; remove the rest so pin count matches storage.
         const [, ...extras] = ids;
         for (const id of extras) {
           try {
             pinnedTabCache.delete(id);
+            awaitingPinUrl.delete(id);
             await chrome.tabs.remove(id);
             log("restore: removed duplicate pinned tab", key, id);
           } catch (err) {
@@ -356,7 +406,7 @@ async function restorePinsInWindow(windowId) {
         saved.length
       );
     } finally {
-      restoringDepth -= 1;
+      endRestoreGuard(windowId);
     }
   })();
 
@@ -402,9 +452,10 @@ function scheduleRestoreRetries(reason, windowId = null) {
   let remaining = delays.length;
   for (const ms of delays) {
     setTimeout(() => {
-      const run = windowId != null
-        ? restorePinsInWindow(windowId)
-        : restorePinsInAllNormalWindows();
+      const run =
+        windowId != null
+          ? restorePinsInWindow(windowId)
+          : restorePinsInAllNormalWindows();
       Promise.resolve(run)
         .catch((err) => warn("restore retry failed:", err))
         .finally(() => {
@@ -415,22 +466,57 @@ function scheduleRestoreRetries(reason, windowId = null) {
   }
 }
 
+/**
+ * Persist a pin only for an explicit user pin (or the first URL commit of a
+ * pin that had no URL yet). Navigating inside an already-pinned tab must NOT
+ * grow storage.
+ */
+async function recordUserPin(tabId, tab) {
+  const pinUrl = await resolveTabUrl(tabId, tab);
+  if (pinUrl) {
+    const key = normalizeUrlKey(pinUrl);
+    pinnedTabCache.set(tabId, { url: pinUrl, key });
+    awaitingPinUrl.delete(tabId);
+    await addPinnedUrl(pinUrl, "user pin");
+    return;
+  }
+  warn(
+    "pin event but URL not ready yet; will save once on first usable URL",
+    tabId,
+    tab?.url,
+    tab?.pendingUrl
+  );
+  pinnedTabCache.set(tabId, { url: null, key: null });
+  awaitingPinUrl.add(tabId);
+}
+
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  // Keep cache in sync; never grow storage from restore-driven updates.
-  if (tab.pinned && (changeInfo.url || changeInfo.status === "complete")) {
+  // First usable URL after a user pin with no URL yet → save once.
+  if (
+    awaitingPinUrl.has(tabId) &&
+    !isRestoring() &&
+    !sessionEnding &&
+    (changeInfo.url || changeInfo.status === "complete" || tab.url)
+  ) {
     const url = await resolveTabUrl(tabId, tab);
     if (url) {
       const key = normalizeUrlKey(url);
       pinnedTabCache.set(tabId, { url, key });
-      if (changeInfo.url && !isRestoring() && !sessionEnding) {
-        await addPinnedUrl(url);
-      }
+      awaitingPinUrl.delete(tabId);
+      await addPinnedUrl(url, "deferred user pin URL");
     }
   } else if (tab.pinned && (changeInfo.url || tab.url)) {
+    // Pinned tab navigated: refresh cache URL for logging, but keep storage key.
+    const cached = pinnedTabCache.get(tabId);
     const url = changeInfo.url || tab.url;
     if (url && !isRestrictedUrl(url)) {
-      pinnedTabCache.set(tabId, { url, key: normalizeUrlKey(url) });
+      pinnedTabCache.set(tabId, {
+        url,
+        key: cached?.key || normalizeUrlKey(url),
+      });
     }
+    // Intentionally do NOT addPinnedUrl here — that caused storage growth
+    // (every click inside a pin became a new global pin on next restore).
   }
 
   if (changeInfo.pinned === undefined) return;
@@ -444,23 +530,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
 
   if (changeInfo.pinned === true) {
-    const pinUrl = await resolveTabUrl(tabId, tab);
-    if (pinUrl) {
-      pinnedTabCache.set(tabId, {
-        url: pinUrl,
-        key: normalizeUrlKey(pinUrl),
-      });
-      await addPinnedUrl(pinUrl);
-    } else {
-      warn(
-        "pin event but URL not ready yet; will save on next URL update",
-        tabId,
-        tab?.url,
-        tab?.pendingUrl
-      );
-      pinnedTabCache.set(tabId, { url: null, key: null });
-    }
+    await recordUserPin(tabId, tab);
   } else if (changeInfo.pinned === false) {
+    awaitingPinUrl.delete(tabId);
     if (!(await browserStillOpen())) {
       log("ignore unpin: browser not open / session ending", tabId);
       pinnedTabCache.delete(tabId);
@@ -480,18 +552,19 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
     const cached = pinnedTabCache.get(tabId);
     pinnedTabCache.delete(tabId);
-    const unpinUrl = cached?.url || (await resolveTabUrl(tabId, tab));
-    if (unpinUrl) {
-      await removePinnedUrl(unpinUrl, "user unpin");
+    const unpinKey = cached?.key || cached?.url || (await resolveTabUrl(tabId, tab));
+    if (unpinKey) {
+      await removePinnedUrl(unpinKey, "user unpin");
     }
   }
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
+  awaitingPinUrl.delete(tabId);
   const cached = pinnedTabCache.get(tabId);
   pinnedTabCache.delete(tabId);
 
-  if (!cached?.url) {
+  if (!cached?.key && !cached?.url) {
     return;
   }
   if (isRestoring()) {
@@ -514,7 +587,7 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
     return;
   }
 
-  await removePinnedUrl(cached.url, "pinned tab closed");
+  await removePinnedUrl(cached.key || cached.url, "pinned tab closed");
 });
 
 chrome.windows.onCreated.addListener((win) => {
@@ -524,13 +597,18 @@ chrome.windows.onCreated.addListener((win) => {
     return;
   }
   log("window created, restoring", win.id);
-  // Only restore this window (not every window) to avoid cross-window churn.
   scheduleRestoreRetries(`windows.onCreated:${win.id}`, win.id);
 });
 
 chrome.windows.onRemoved.addListener(async (windowId) => {
   restoreInFlight.delete(windowId);
   restoreSatisfiedAt.delete(windowId);
+  const settle = restoreSettleTimers.get(windowId);
+  if (settle) {
+    clearTimeout(settle);
+    restoreSettleTimers.delete(windowId);
+    restoringDepth = Math.max(0, restoringDepth - 1);
+  }
   try {
     const left = await chrome.windows.getAll({ windowTypes: ["normal"] });
     if (left.length === 0) {
@@ -561,18 +639,27 @@ chrome.runtime.onInstalled.addListener((details) => {
     log("service worker start; stored pins:", saved);
 
     const tabs = await chrome.tabs.query({ pinned: true });
+    const savedKeys = new Set(
+      saved.map((u) => normalizeUrlKey(u)).filter(Boolean)
+    );
     for (const tab of tabs) {
       const url = pickUsableUrl(tab);
       if (tab.id != null && url) {
-        pinnedTabCache.set(tab.id, { url, key: normalizeUrlKey(url) });
+        const key = normalizeUrlKey(url);
+        // Prefer matching an existing storage key when possible.
+        const storageKey =
+          (key && savedKeys.has(key) && key) ||
+          [...savedKeys].find((k) => key && k === key) ||
+          key;
+        pinnedTabCache.set(tab.id, { url, key: storageKey });
       }
     }
-    // Backfill storage only for keys missing from the saved list — never
-    // append variants that normalize to an existing entry.
+    // Backfill only when storage is empty (first install / wiped). Never grow
+    // from mid-session open pins.
     if (saved.length === 0 && tabs.length > 0) {
       for (const tab of tabs) {
         const url = pickUsableUrl(tab);
-        if (url) await addPinnedUrl(url);
+        if (url) await addPinnedUrl(url, "empty-storage backfill");
       }
       log("backfilled empty storage from", tabs.length, "pinned tabs");
     }
