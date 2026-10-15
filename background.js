@@ -6,9 +6,15 @@
  *
  * Storage grows only on an explicit user pin (changeInfo.pinned === true),
  * never from restore or from navigating inside an already-pinned tab.
+ *
+ * A pin is a tab identity: navigating inside it must not reload it back to
+ * the stored URL, and restore must not close it or create a duplicate for
+ * the same storage entry.
  */
 
 const STORAGE_KEY = "pinnedUrls";
+/** tabId(string) → storage URL key; survives SW restarts within the browser session. */
+const BINDINGS_KEY = "pinTabBindings";
 const LOG_PREFIX = "[Proper Pinned Tabs]";
 
 /** Settle time so late create/navigation events stay under the restore guard. */
@@ -99,7 +105,6 @@ function normalizeUrlKey(url) {
       path = path.slice(0, -1);
     }
     const host = u.hostname.toLowerCase();
-    // Ignore protocol (http vs https) and hash for matching.
     return `${host}${path}${u.search}`;
   } catch {
     return null;
@@ -178,27 +183,68 @@ async function compactPinnedUrls() {
   return deduped;
 }
 
+/** tabId → storage key bindings for this browser session. */
+async function getBindings() {
+  try {
+    const result = await chrome.storage.session.get(BINDINGS_KEY);
+    const map = result[BINDINGS_KEY];
+    return map && typeof map === "object" ? { ...map } : {};
+  } catch (err) {
+    warn("session bindings read failed", err);
+    return {};
+  }
+}
+
+async function setBindings(map) {
+  try {
+    await chrome.storage.session.set({ [BINDINGS_KEY]: map });
+  } catch (err) {
+    warn("session bindings write failed", err);
+  }
+}
+
+async function bindTabToKey(tabId, key, currentUrl) {
+  if (tabId == null || !key) return;
+  pinnedTabCache.set(tabId, { url: currentUrl || null, key });
+  awaitingPinUrl.delete(tabId);
+  const map = await getBindings();
+  map[String(tabId)] = key;
+  await setBindings(map);
+}
+
+async function unbindTab(tabId) {
+  if (tabId == null) return;
+  pinnedTabCache.delete(tabId);
+  awaitingPinUrl.delete(tabId);
+  const map = await getBindings();
+  if (map[String(tabId)]) {
+    delete map[String(tabId)];
+    await setBindings(map);
+  }
+}
+
 /** Add URL to the ordered list if not already present (dedupe by normalized key). */
 async function addPinnedUrl(url, reason) {
   if (isRestoring()) {
     log("save skipped (restoring):", url, reason || "");
-    return;
+    return null;
   }
   if (!url || isRestrictedUrl(url)) {
     warn("skip save: restricted or empty URL", url);
-    return;
+    return null;
   }
   const key = normalizeUrlKey(url);
-  if (!key) return;
+  if (!key) return null;
 
   const urls = await getPinnedUrls();
   if (urls.some((u) => normalizeUrlKey(u) === key)) {
     log("save skipped (already stored):", url, "key=", key);
-    return;
+    return key;
   }
   urls.push(canonicalStoredUrl(url));
   await setPinnedUrls(urls);
   log("saved pin:", url, "key=", key, reason || "");
+  return key;
 }
 
 async function removePinnedUrl(urlOrKey, reason) {
@@ -244,7 +290,6 @@ function beginRestoreGuard(windowId) {
 }
 
 function endRestoreGuard(windowId) {
-  // Keep the guard up briefly so tabs.create navigation/pin events settle.
   const prev = restoreSettleTimers.get(windowId);
   if (prev) clearTimeout(prev);
   const timer = setTimeout(() => {
@@ -256,9 +301,9 @@ function endRestoreGuard(windowId) {
 }
 
 /**
- * Ensure each saved URL is present as a pinned tab in the given window,
- * in stored order. Matching uses normalized URL keys. Idempotent / safe to retry.
- * Never writes to chrome.storage.local.
+ * Ensure each saved pin entry is represented by some pinned tab in the window.
+ * Never navigates/reloads existing pins. Never closes a pin just because its
+ * current URL differs from the stored URL (user may be working in it).
  */
 async function restorePinsInWindow(windowId) {
   if (windowId == null) return;
@@ -283,52 +328,156 @@ async function restorePinsInWindow(windowId) {
       return;
     }
 
+    const savedKeys = saved
+      .map((u) => normalizeUrlKey(u))
+      .filter(Boolean);
+    const savedKeySet = new Set(savedKeys);
+
+    // Skip if this window was already fully restored recently and still covered.
+    const lastDone = restoreSatisfiedAt.get(windowId);
+    if (lastDone && Date.now() - lastDone < 10000) {
+      const tabsQuick = await chrome.tabs.query({ windowId, pinned: true });
+      const bindingsQuick = await getBindings();
+      const coveredQuick = new Set();
+      for (const tab of tabsQuick) {
+        const bound = bindingsQuick[String(tab.id)];
+        if (bound && savedKeySet.has(bound)) coveredQuick.add(bound);
+        else {
+          const k = tabMatchKey(tab);
+          if (k && savedKeySet.has(k)) coveredQuick.add(k);
+        }
+      }
+      if (
+        coveredQuick.size >= savedKeys.length ||
+        tabsQuick.length >= savedKeys.length
+      ) {
+        log(
+          "restore skip: window already satisfied",
+          windowId,
+          "pins=",
+          tabsQuick.length,
+          "covered=",
+          coveredQuick.size
+        );
+        return;
+      }
+    }
+
     beginRestoreGuard(windowId);
     try {
       let tabs = await chrome.tabs.query({ windowId });
+      let bindings = await getBindings();
 
-      /** @type {Map<string, chrome.tabs.Tab>} */
-      const tabsByKey = new Map();
+      // Drop stale bindings for tabs that no longer exist in this window.
+      const liveIds = new Set(tabs.map((t) => String(t.id)));
+      let bindingsDirty = false;
+      for (const id of Object.keys(bindings)) {
+        if (!liveIds.has(id)) {
+          delete bindings[id];
+          bindingsDirty = true;
+        }
+      }
+      if (bindingsDirty) await setBindings(bindings);
+
+      /** storageKey → pinned tab already bound or URL-matched */
+      const pinnedByStorageKey = new Map();
+      const unboundPinned = [];
+
       for (const tab of tabs) {
-        const key = tabMatchKey(tab);
-        if (!key) continue;
-        const prev = tabsByKey.get(key);
-        // Prefer an already-pinned tab when several match the same key.
-        if (!prev || (tab.pinned && !prev.pinned)) {
-          tabsByKey.set(key, tab);
+        if (!tab.pinned || tab.id == null) continue;
+        const bound = bindings[String(tab.id)];
+        if (bound && savedKeySet.has(bound)) {
+          if (!pinnedByStorageKey.has(bound)) {
+            pinnedByStorageKey.set(bound, tab);
+          }
+          pinnedTabCache.set(tab.id, {
+            url: pickUsableUrl(tab),
+            key: bound,
+          });
+          continue;
+        }
+        const urlKey = tabMatchKey(tab);
+        if (urlKey && savedKeySet.has(urlKey) && !pinnedByStorageKey.has(urlKey)) {
+          pinnedByStorageKey.set(urlKey, tab);
+          await bindTabToKey(tab.id, urlKey, pickUsableUrl(tab));
+          bindings[String(tab.id)] = urlKey;
+          continue;
+        }
+        unboundPinned.push(tab);
+      }
+
+      // If we already have enough pinned tabs for the saved set, bind leftover
+      // saved keys to unbound navigated pins — do NOT create or navigate.
+      if (
+        pinnedByStorageKey.size + unboundPinned.length >= savedKeys.length &&
+        pinnedByStorageKey.size < savedKeys.length
+      ) {
+        for (const key of savedKeys) {
+          if (pinnedByStorageKey.has(key)) continue;
+          const tab = unboundPinned.shift();
+          if (!tab) break;
+          await bindTabToKey(tab.id, key, pickUsableUrl(tab));
+          bindings[String(tab.id)] = key;
+          pinnedByStorageKey.set(key, tab);
+          log("restore: bound navigated pin to storage key", key, tab.id);
         }
       }
 
-      const satisfied = new Set();
-      let insertIndex = 0;
+      if (pinnedByStorageKey.size >= savedKeys.length) {
+        restoreSatisfiedAt.set(windowId, Date.now());
+        log(
+          "restore done (already covered) window",
+          windowId,
+          "covered=",
+          pinnedByStorageKey.size,
+          "/",
+          savedKeys.length
+        );
+        return;
+      }
 
+      // Refresh tabs/bindings after possible binds.
+      tabs = await chrome.tabs.query({ windowId });
+      bindings = await getBindings();
+
+      let insertIndex = 0;
       for (const url of saved) {
         const key = normalizeUrlKey(url);
-        if (!key) {
-          warn("Skipping restricted/unparseable URL on restore:", url);
+        if (!key) continue;
+
+        const already = pinnedByStorageKey.get(key);
+        if (already) {
+          // Do not navigate/reload. Optional reorder only.
+          if (already.index !== insertIndex) {
+            try {
+              await chrome.tabs.move(already.id, { index: insertIndex });
+            } catch (err) {
+              warn("Failed to reorder pin:", key, err);
+            }
+          }
+          insertIndex += 1;
           continue;
         }
-        if (satisfied.has(key)) continue;
 
-        const existing = tabsByKey.get(key);
-        if (existing) {
+        // Prefer pinning an existing unpinned tab with this URL (e.g. history)
+        // instead of creating a duplicate tab — only when this slot is missing.
+        const unpinnedMatch = tabs.find(
+          (t) =>
+            !t.pinned &&
+            t.id != null &&
+            tabMatchKey(t) === key &&
+            !bindings[String(t.id)]
+        );
+        if (unpinnedMatch) {
           try {
-            if (!existing.pinned) {
-              // Only pin an open tab when its URL exactly matches a saved pin.
-              await chrome.tabs.update(existing.id, { pinned: true });
-              log("restore: pinned existing tab", url, "key=", key);
-            }
-            if (existing.index !== insertIndex) {
-              await chrome.tabs.move(existing.id, { index: insertIndex });
-            }
-            if (existing.id != null) {
-              pinnedTabCache.set(existing.id, { url, key });
-              awaitingPinUrl.delete(existing.id);
-            }
+            await chrome.tabs.update(unpinnedMatch.id, { pinned: true });
+            await chrome.tabs.move(unpinnedMatch.id, { index: insertIndex });
+            await bindTabToKey(unpinnedMatch.id, key, pickUsableUrl(unpinnedMatch));
+            pinnedByStorageKey.set(key, unpinnedMatch);
+            log("restore: pinned existing unpinned tab", url, "key=", key);
           } catch (err) {
-            warn("Failed to adopt existing tab:", url, err);
+            warn("Failed to pin existing tab:", url, err);
           }
-          satisfied.add(key);
           insertIndex += 1;
           continue;
         }
@@ -342,54 +491,37 @@ async function restorePinsInWindow(windowId) {
             index: insertIndex,
           });
           if (created.id != null) {
-            pinnedTabCache.set(created.id, { url, key });
-            awaitingPinUrl.delete(created.id);
-            tabsByKey.set(key, created);
+            await bindTabToKey(created.id, key, url);
+            pinnedByStorageKey.set(key, created);
           }
           log("restore: created pinned tab", url, "key=", key);
-          satisfied.add(key);
           insertIndex += 1;
         } catch (err) {
           warn("Failed to create pinned tab:", url, err);
         }
       }
 
-      // Remove extra pinned tabs that duplicate a saved key, and any pin whose
-      // URL is not in the saved set (leftovers from older buggy growth).
-      tabs = await chrome.tabs.query({ windowId });
-      const savedKeys = new Set(
-        saved.map((u) => normalizeUrlKey(u)).filter(Boolean)
-      );
+      // Dedupe only: multiple tabs bound to the same storage key (keep first).
+      // Never close a pin merely because its current URL ≠ stored URL.
+      tabs = await chrome.tabs.query({ windowId, pinned: true });
+      bindings = await getBindings();
       /** @type {Map<string, number[]>} */
-      const pinnedIdsByKey = new Map();
+      const idsByKey = new Map();
       for (const tab of tabs) {
-        if (!tab.pinned || tab.id == null) continue;
-        const key = tabMatchKey(tab);
-        if (!key) continue;
-        if (!savedKeys.has(key)) {
-          // Orphan pin: not in storage — close it so browsing leftovers vanish.
-          try {
-            pinnedTabCache.delete(tab.id);
-            awaitingPinUrl.delete(tab.id);
-            await chrome.tabs.remove(tab.id);
-            log("restore: removed orphan pinned tab", key, tab.id);
-          } catch (err) {
-            warn("Failed to remove orphan pin", key, tab.id, err);
-          }
-          continue;
-        }
-        if (!pinnedIdsByKey.has(key)) pinnedIdsByKey.set(key, []);
-        pinnedIdsByKey.get(key).push(tab.id);
+        if (tab.id == null) continue;
+        const key = bindings[String(tab.id)];
+        if (!key || !savedKeySet.has(key)) continue;
+        if (!idsByKey.has(key)) idsByKey.set(key, []);
+        idsByKey.get(key).push(tab.id);
       }
-      for (const [key, ids] of pinnedIdsByKey) {
+      for (const [key, ids] of idsByKey) {
         if (ids.length <= 1) continue;
         const [, ...extras] = ids;
         for (const id of extras) {
           try {
-            pinnedTabCache.delete(id);
-            awaitingPinUrl.delete(id);
+            await unbindTab(id);
             await chrome.tabs.remove(id);
-            log("restore: removed duplicate pinned tab", key, id);
+            log("restore: removed duplicate pin for key", key, id);
           } catch (err) {
             warn("Failed to remove duplicate pin", key, id, err);
           }
@@ -400,10 +532,10 @@ async function restorePinsInWindow(windowId) {
       log(
         "restore done window",
         windowId,
-        "satisfied",
-        satisfied.size,
+        "covered=",
+        pinnedByStorageKey.size,
         "/",
-        saved.length
+        savedKeys.length
       );
     } finally {
       endRestoreGuard(windowId);
@@ -438,7 +570,7 @@ const scheduledReasons = new Set();
 
 /**
  * Startup/session restore races: windows or tabs may not exist yet when
- * onStartup fires. Retries are idempotent (normalize match + in-flight lock).
+ * onStartup fires. Retries are idempotent and skip when already satisfied.
  */
 function scheduleRestoreRetries(reason, windowId = null) {
   if (scheduledReasons.has(reason)) {
@@ -474,10 +606,12 @@ function scheduleRestoreRetries(reason, windowId = null) {
 async function recordUserPin(tabId, tab) {
   const pinUrl = await resolveTabUrl(tabId, tab);
   if (pinUrl) {
-    const key = normalizeUrlKey(pinUrl);
-    pinnedTabCache.set(tabId, { url: pinUrl, key });
-    awaitingPinUrl.delete(tabId);
-    await addPinnedUrl(pinUrl, "user pin");
+    const key = await addPinnedUrl(pinUrl, "user pin");
+    if (key) await bindTabToKey(tabId, key, pinUrl);
+    else {
+      const fallbackKey = normalizeUrlKey(pinUrl);
+      if (fallbackKey) await bindTabToKey(tabId, fallbackKey, pinUrl);
+    }
     return;
   }
   warn(
@@ -500,23 +634,25 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   ) {
     const url = await resolveTabUrl(tabId, tab);
     if (url) {
-      const key = normalizeUrlKey(url);
-      pinnedTabCache.set(tabId, { url, key });
+      const key = await addPinnedUrl(url, "deferred user pin URL");
+      const bindKey = key || normalizeUrlKey(url);
+      if (bindKey) await bindTabToKey(tabId, bindKey, url);
       awaitingPinUrl.delete(tabId);
-      await addPinnedUrl(url, "deferred user pin URL");
     }
   } else if (tab.pinned && (changeInfo.url || tab.url)) {
-    // Pinned tab navigated: refresh cache URL for logging, but keep storage key.
+    // Navigated inside a pin: keep storage key; do not addPinnedUrl / reload.
     const cached = pinnedTabCache.get(tabId);
+    const bindings = await getBindings();
+    const key = cached?.key || bindings[String(tabId)] || null;
     const url = changeInfo.url || tab.url;
-    if (url && !isRestrictedUrl(url)) {
+    if (key) {
       pinnedTabCache.set(tabId, {
-        url,
-        key: cached?.key || normalizeUrlKey(url),
+        url: url && !isRestrictedUrl(url) ? url : cached?.url || null,
+        key,
       });
+    } else if (url && !isRestrictedUrl(url)) {
+      pinnedTabCache.set(tabId, { url, key: cached?.key || null });
     }
-    // Intentionally do NOT addPinnedUrl here — that caused storage growth
-    // (every click inside a pin became a new global pin on next restore).
   }
 
   if (changeInfo.pinned === undefined) return;
@@ -535,7 +671,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     awaitingPinUrl.delete(tabId);
     if (!(await browserStillOpen())) {
       log("ignore unpin: browser not open / session ending", tabId);
-      pinnedTabCache.delete(tabId);
+      await unbindTab(tabId);
       return;
     }
     let stillExists = true;
@@ -546,13 +682,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     }
     if (!stillExists) {
       log("ignore unpin: tab already gone (teardown)", tabId);
-      pinnedTabCache.delete(tabId);
+      await unbindTab(tabId);
       return;
     }
 
     const cached = pinnedTabCache.get(tabId);
-    pinnedTabCache.delete(tabId);
-    const unpinKey = cached?.key || cached?.url || (await resolveTabUrl(tabId, tab));
+    const bindings = await getBindings();
+    const unpinKey =
+      cached?.key ||
+      bindings[String(tabId)] ||
+      (await resolveTabUrl(tabId, tab));
+    await unbindTab(tabId);
     if (unpinKey) {
       await removePinnedUrl(unpinKey, "user unpin");
     }
@@ -562,20 +702,22 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   awaitingPinUrl.delete(tabId);
   const cached = pinnedTabCache.get(tabId);
-  pinnedTabCache.delete(tabId);
+  const bindings = await getBindings();
+  const key = cached?.key || bindings[String(tabId)] || cached?.url;
+  await unbindTab(tabId);
 
-  if (!cached?.key && !cached?.url) {
+  if (!key) {
     return;
   }
   if (isRestoring()) {
-    log("ignore remove while restoring", cached.url);
+    log("ignore remove while restoring", key);
     return;
   }
 
   if (removeInfo.isWindowClosing || sessionEnding) {
     log(
       "preserve pin on window/session close:",
-      cached.url,
+      key,
       "isWindowClosing=",
       removeInfo.isWindowClosing
     );
@@ -583,11 +725,11 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   }
 
   if (!(await browserStillOpen())) {
-    log("preserve pin: no windows left:", cached.url);
+    log("preserve pin: no windows left:", key);
     return;
   }
 
-  await removePinnedUrl(cached.key || cached.url, "pinned tab closed");
+  await removePinnedUrl(key, "pinned tab closed");
 });
 
 chrome.windows.onCreated.addListener((win) => {
@@ -632,34 +774,40 @@ chrome.runtime.onInstalled.addListener((details) => {
   scheduleRestoreRetries("onInstalled");
 });
 
-// Seed cache, compact storage, restore whenever the service worker starts.
+// Seed cache/bindings and restore whenever the service worker starts.
 (async () => {
   try {
     const saved = await compactPinnedUrls();
     log("service worker start; stored pins:", saved);
 
-    const tabs = await chrome.tabs.query({ pinned: true });
     const savedKeys = new Set(
       saved.map((u) => normalizeUrlKey(u)).filter(Boolean)
     );
+    const tabs = await chrome.tabs.query({ pinned: true });
+    const bindings = await getBindings();
+
     for (const tab of tabs) {
+      if (tab.id == null) continue;
       const url = pickUsableUrl(tab);
-      if (tab.id != null && url) {
-        const key = normalizeUrlKey(url);
-        // Prefer matching an existing storage key when possible.
-        const storageKey =
-          (key && savedKeys.has(key) && key) ||
-          [...savedKeys].find((k) => key && k === key) ||
-          key;
-        pinnedTabCache.set(tab.id, { url, key: storageKey });
+      const urlKey = url ? normalizeUrlKey(url) : null;
+      const existing = bindings[String(tab.id)];
+      if (existing && savedKeys.has(existing)) {
+        pinnedTabCache.set(tab.id, { url, key: existing });
+      } else if (urlKey && savedKeys.has(urlKey)) {
+        await bindTabToKey(tab.id, urlKey, url);
+      } else if (url) {
+        pinnedTabCache.set(tab.id, { url, key: existing || null });
       }
     }
-    // Backfill only when storage is empty (first install / wiped). Never grow
-    // from mid-session open pins.
+
+    // Backfill only when storage is empty (first install / wiped).
     if (saved.length === 0 && tabs.length > 0) {
       for (const tab of tabs) {
         const url = pickUsableUrl(tab);
-        if (url) await addPinnedUrl(url, "empty-storage backfill");
+        if (url) {
+          const key = await addPinnedUrl(url, "empty-storage backfill");
+          if (key && tab.id != null) await bindTabToKey(tab.id, key, url);
+        }
       }
       log("backfilled empty storage from", tabs.length, "pinned tabs");
     }
